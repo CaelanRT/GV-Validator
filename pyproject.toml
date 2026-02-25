@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gv-validator"
+version = "0.1.0"
+description = "Validation Reconciliation Agent CLI for PQ protocol automation."
+readme = "spec.md"
+requires-python = ">=3.9"
+dependencies = [
+  "typer>=0.12.0",
+  "pydantic>=2.6.0",
+  "pymupdf>=1.26.0",
+  "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+vra = "vra.cli:app"
+run-reconciliation = "vra.runner:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
