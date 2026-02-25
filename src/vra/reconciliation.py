@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .models import Decision, ReconciliationRow
 from .pdf_protocol import apply_pass_fail_value, extract_protocol_rows, render_protocol_crop
@@ -19,6 +19,7 @@ def run_reconciliation(
     test_id: str,
     threshold: float,
     output_dir: Path,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[Path, Path, Path, List[ReconciliationRow]]:
     protocol_rows = extract_protocol_rows(protocol_pdf, test_id=test_id)
     report_blocks = extract_report_blocks(report_pdf)
@@ -64,6 +65,15 @@ def run_reconciliation(
                             report_page_index=None,
                         )
                     )
+                    if progress_callback:
+                        progress_callback(
+                            len(rows),
+                            len(expected_keys),
+                            (
+                                f"repeat {repeat_id} diff {difference_id}: "
+                                "auto-pass (repeat has zero differences)"
+                            ),
+                        )
                 else:
                     evidence = ["missing_difference_id"]
                     if protocol_row is None:
@@ -86,6 +96,15 @@ def run_reconciliation(
                             report_page_index=None,
                         )
                     )
+                    if progress_callback:
+                        progress_callback(
+                            len(rows),
+                            len(expected_keys),
+                            (
+                                f"repeat {repeat_id} diff {difference_id}: "
+                                "missing report difference"
+                            ),
+                        )
                 continue
 
             evidence_dir = output_dir / "evidence" / f"r{repeat_id}_d{difference_id}"
@@ -136,16 +155,19 @@ def run_reconciliation(
                 report_master=report_master,
                 report_sample=report_sample,
             )
+            effective_confidence = (
+                comparison.confidence if comparison.confidence is not None else 1.0
+            )
             if protocol_row is None:
                 decision = Decision.UNSET
                 reason = (
                     "Protocol row mapping missing for this repeat/difference; "
                     "manual review required."
                 )
-            elif comparison.match and (comparison.confidence or 0.0) >= threshold:
+            elif comparison.match and effective_confidence >= threshold:
                 decision = Decision.PASS
                 reason = comparison.reason
-            elif (comparison.confidence or 0.0) >= threshold:
+            elif effective_confidence >= threshold:
                 decision = Decision.FAIL
                 reason = comparison.reason
             else:
@@ -178,6 +200,15 @@ def run_reconciliation(
                     report_page_index=report_block.page_index,
                 )
             )
+            if progress_callback:
+                progress_callback(
+                    len(rows),
+                    len(expected_keys),
+                    (
+                        f"repeat {repeat_id} diff {difference_id}: "
+                        f"{rows[-1].decision.value}"
+                    ),
+                )
 
     for repeat_id, difference_id in sorted(report_lookup.keys()):
         if (repeat_id, difference_id) in expected_keys:

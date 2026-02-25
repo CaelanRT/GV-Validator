@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import typer
 from dotenv import load_dotenv
@@ -44,12 +45,30 @@ def run_reconciliation_command(
     if not report.exists():
         raise typer.BadParameter(f"Report PDF not found: {report}")
 
+    last_printed: Optional[int] = None
+
+    def progress_update(processed: int, total: int, message: str) -> None:
+        nonlocal last_printed
+        percent = int((processed / total) * 100) if total else 0
+        # Print at useful milestones to avoid noisy logs.
+        if (
+            processed in (1, total)
+            or processed % 5 == 0
+            or percent in (25, 50, 75)
+            or percent != last_printed
+            and processed <= 3
+        ):
+            typer.echo(f"[{processed}/{total}] {percent}% - {message}")
+            last_printed = percent
+
+    typer.echo("Starting reconciliation...")
     out_pdf, out_csv, out_exceptions, rows = run_reconciliation(
         protocol_pdf=protocol,
         report_pdf=report,
         test_id=test_id,
         threshold=threshold,
         output_dir=output_dir,
+        progress_callback=progress_update,
     )
 
     total = len(rows)

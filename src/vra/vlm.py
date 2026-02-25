@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import base64
+import ast
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, Optional
 import time
 from urllib import error, parse, request
 
 from .models import ComparisonResult
+
+VLM_CACHE_VERSION = "v2"
 
 
 def _encode_image(path: Path) -> str:
@@ -28,6 +32,21 @@ def _extract_response_text(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_candidate_obj(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = payload.get("candidates", [])
+    if not candidates:
+        return None
+    content = candidates[0].get("content", {})
+    for part in content.get("parts", []):
+        if isinstance(part.get("text"), str):
+            continue
+        if isinstance(part.get("json"), dict):
+            return part["json"]
+        if isinstance(part.get("inlineData"), dict):
+            continue
+    return None
+
+
 def _strip_json_fence(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -41,15 +60,83 @@ def _parse_model_json(text: str) -> Dict[str, Any]:
     cleaned = _strip_json_fence(text)
     try:
         parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as first_exc:
+        parsed = None
         start = cleaned.find("{")
         end = cleaned.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        parsed = json.loads(cleaned[start : end + 1])
+        if start >= 0 and end > start:
+            candidate = cleaned[start : end + 1]
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                try:
+                    parsed = ast.literal_eval(candidate)
+                except (SyntaxError, ValueError):
+                    parsed = None
+        if parsed is None:
+            try:
+                parsed = ast.literal_eval(cleaned)
+            except (SyntaxError, ValueError):
+                parsed = None
+        if parsed is None:
+            partial: Dict[str, Any] = {}
+            match_match = re.search(
+                r'["\']?match["\']?\s*:\s*(true|false)', cleaned, re.IGNORECASE
+            )
+            if match_match:
+                partial["match"] = match_match.group(1).lower() == "true"
+            confidence_match = re.search(
+                r'["\']?confidence["\']?\s*:\s*([0-9]*\.?[0-9]+)',
+                cleaned,
+                re.IGNORECASE,
+            )
+            if confidence_match:
+                partial["confidence"] = float(confidence_match.group(1))
+            reason_match = re.search(
+                r'["\']?reason["\']?\s*:\s*["\']([^"\']*)',
+                cleaned,
+                re.IGNORECASE,
+            )
+            if reason_match:
+                partial["reason"] = reason_match.group(1)
+            if "match" in partial:
+                return partial
+            raise first_exc
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        parsed = parsed[0]
     if not isinstance(parsed, dict):
         raise ValueError("Model response JSON must be an object.")
     return parsed
+
+
+def _coerce_comparison_payload(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {str(k).lower(): v for k, v in parsed.items()}
+    if "match" not in normalized:
+        raise ValueError("Model response missing 'match' field.")
+    raw_match = normalized["match"]
+    if isinstance(raw_match, bool):
+        match_value = raw_match
+    elif isinstance(raw_match, str):
+        lowered = raw_match.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            match_value = True
+        elif lowered in {"false", "no", "0"}:
+            match_value = False
+        else:
+            raise ValueError("Model response 'match' value is not boolean.")
+    else:
+        match_value = bool(raw_match)
+    reason = normalized.get("reason")
+    confidence = normalized.get("confidence")
+    return {
+        "match": match_value,
+        "reason": (
+            str(reason)
+            if reason is not None and str(reason).strip()
+            else "Model response did not include reason."
+        ),
+        "confidence": float(confidence) if confidence is not None else None,
+    }
 
 
 class VLMClient:
@@ -110,6 +197,7 @@ class VLMClient:
         report_sample: Path,
     ) -> str:
         hasher = hashlib.sha256()
+        hasher.update(VLM_CACHE_VERSION.encode("utf-8"))
         hasher.update(self.model_name.encode("utf-8"))
         for path in (pq_master, pq_sample, report_master, report_sample):
             hasher.update(path.read_bytes())
@@ -157,9 +245,9 @@ class VLMClient:
             "You will receive 4 images in order:\n"
             "1) protocol master, 2) protocol sample, 3) report master, 4) report sample.\n"
             "Decide if the report pair matches the protocol pair for the same difference ID.\n"
-            "Return ONLY strict JSON with keys:\n"
-            '{"match": boolean, "reason": string, "confidence": number}\n'
-            "Use confidence in [0.0, 1.0]."
+            "Return EXACTLY one JSON object on one line with keys:\n"
+            '{"match": true|false, "reason": "short string", "confidence": 0.0}\n'
+            "Rules: reason must be <= 8 words. confidence must be [0.0, 1.0]."
         )
 
         payload = {
@@ -197,8 +285,7 @@ class VLMClient:
             ],
             "generationConfig": {
                 "temperature": 0.0,
-                "responseMimeType": "application/json",
-                "maxOutputTokens": 300,
+                "maxOutputTokens": 80,
             },
         }
         endpoint = (
@@ -221,14 +308,17 @@ class VLMClient:
                     response_payload = json.loads(resp.read().decode("utf-8"))
                 self._last_request_at = time.time()
                 model_text = _extract_response_text(response_payload)
-                if not model_text:
-                    return ComparisonResult(
-                        match=False,
-                        reason="Gemini returned no text payload for comparison.",
-                        confidence=0.0,
-                    )
+                parsed_obj = _extract_candidate_obj(response_payload)
+                if parsed_obj is None:
+                    if not model_text:
+                        return ComparisonResult(
+                            match=False,
+                            reason="Gemini returned no text payload for comparison.",
+                            confidence=0.0,
+                        )
+                    parsed_obj = _parse_model_json(model_text)
 
-                parsed = _parse_model_json(model_text)
+                parsed = _coerce_comparison_payload(parsed_obj)
                 result = ComparisonResult.model_validate(parsed)
                 if result.confidence is not None:
                     result.confidence = max(0.0, min(1.0, float(result.confidence)))
@@ -250,7 +340,7 @@ class VLMClient:
                     time.sleep(2**attempt)
                     continue
                 break
-            except (json.JSONDecodeError, ValueError) as exc:
+            except (json.JSONDecodeError, ValueError, SyntaxError) as exc:
                 return ComparisonResult(
                     match=False,
                     reason=f"Gemini response parsing failed: {exc}",
